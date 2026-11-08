@@ -17025,6 +17025,898 @@ if MAIN_AUTOSTART and AutoFarmToggle then
         end
     end)
 end
+-- ==========================================================
+-- METHION PVP MODULE (ported from Vanta)
+-- Auto Parry | Auto Barrage | Camera Lock
+-- ==========================================================
+do
+    local okPvP, errPvP = pcall(function()
+
+        -- ==================================================
+        -- 1) AUTO PARRY
+        -- ==================================================
+        local Parry = {
+            Enabled = false,
+            Running = false,
+            Connections = {},
+            Cleanup,
+            Config = {
+                ReactionDelay = 0.05,      -- seconds before blocking
+                BlockRange = 25,           -- studs
+                ProjectileRangeBonus = 15,
+                PingCompensation = true,
+                ExtraDelayEnabled = true,
+                ExtraDelayAmount = 0.05,
+                FarTargetDelay = 0.3,
+                DistanceThreshold = 0.7,
+                StandDelay = 0.02,
+                UnblockBaseDelay = 0.22,
+                UnblockPingScale = 0.5,
+                Reblocking = true,
+                KeepBlock = true,
+                Unblocking = true,
+                ProjectilesPriority = true,
+                ColiseumMode = false,
+            },
+        }
+
+        local function parryGetChar() return LP.Character end
+        local function parryGetHRP()
+            local c = parryGetChar()
+            return c and c:FindFirstChild("HumanoidRootPart")
+        end
+        local function parryPing()
+            local ok, p = pcall(function() return LP:GetNetworkPing() end)
+            return ok and p or 0
+        end
+        local function parryTimeStop()
+            return workspace:FindFirstChild("TimeStop")
+                or game:GetService("Lighting"):FindFirstChild("TimeStop")
+        end
+        local function parryRagdolled(char)
+            return char and char:FindFirstChild("RagdollParts") ~= nil
+        end
+
+        local function fireParryBlock(state, char)
+            if not char then return end
+            local remote = char:FindFirstChild("RemoteEvent")
+            if not remote then return end
+            local bc = char:FindFirstChild("Blocking_Capacity")
+            if bc and bc.Value <= 0 then
+                -- broken guard; still try
+            end
+            for _ = 1, 3 do
+                pcall(function() remote:FireServer("StartBlocking", "pass") end)
+                task.wait()
+            end
+            state.Blocking = true
+        end
+
+        local function fireParryUnblock(state, char, force)
+            if not char or (not state.Blocking and not force) then return end
+            local remote = char:FindFirstChild("RemoteEvent")
+            if remote then
+                for _ = 1, 5 do
+                    pcall(function() remote:FireServer("StopBlocking", "pass") end)
+                    task.wait()
+                end
+            end
+            state.Blocking = false
+            state.BlockActions = false
+        end
+
+        local function doBlock(state, cfg, def, addw, priority)
+            local char = parryGetChar()
+            if not char then return end
+            local remote = char:FindFirstChild("RemoteEvent")
+            if remote then
+                pcall(function() remote:FireServer("HoldAttack", {Bool = false, Type = "m1"}) end)
+                pcall(function() remote:FireServer("HoldAttack", {Bool = false, Type = "barrage"}) end)
+                pcall(function() remote:FireServer("InputEnded", {Input = Enum.KeyCode.E}) end)
+            end
+
+            state.LastBlock = state.LastBlock + 1
+            local token = state.LastBlock
+
+            local ping = cfg.PingCompensation and parryPing() or 0
+            local waitTime = math.max(0, (cfg.ReactionDelay or 0) - ping)
+            if cfg.ExtraDelayEnabled then waitTime = waitTime + (cfg.ExtraDelayAmount or 0) end
+            task.wait(waitTime)
+
+            if state.LastBlock ~= token then return end
+            if parryTimeStop() then
+                state.BlockActions = false
+                return
+            end
+
+            fireParryBlock(state, char)
+            local unblockDelay = math.max(0.02, parryPing() * (cfg.UnblockPingScale or 0.5))
+                + (cfg.UnblockBaseDelay or 0.22)
+                + math.max(0, addw or 0)
+            task.wait(unblockDelay)
+
+            if state.LastBlock ~= token then return end
+            if parryTimeStop() then return end
+            state.BlockActions = false
+            fireParryUnblock(state, char, false)
+        end
+
+        local PERFECT_SOUNDS = {
+            ["rbxassetid://7217913060"] = {def = 0.2},
+            ["rbxassetid://4725629903"] = {def = 0.2},
+            ["rbxassetid://6032844827"] = {def = 0.2},
+            ["rbxassetid://163619849"]  = {def = 0.2},
+            ["rbxassetid://7217914447"] = {def = 0},
+        }
+        local BASE_SOUNDS = {
+            ["rbxassetid://6032836072"] = {def = 0.3},
+            ["rbxassetid://6034138660"] = {def = 0.3},
+            ["rbxassetid://5074434156"] = {def = 0.3},
+            ["rbxassetid://6572639359"] = {def = 0.3},
+            ["rbxassetid://6570678905"] = {def = 0.3},
+            ["rbxassetid://10459370874"] = {def = 0.35, addw = -0.35, dist = 15},
+            ["rbxassetid://12440326715"] = {addw = -0.1, dist = 15},
+            ["rbxassetid://74034132845527"] = {def = 0.4},
+        }
+        local ANIM_UNBLOCK = {
+            "rbxassetid://12293318922",
+            "rbxassetid://13819646949",
+            "rbxassetid://6780937804",
+            "rbxassetid://6780982308",
+            {"rbxassetid://10443019808", {dist = 10}},
+        }
+        local PROJ_PATTERNS = {
+            {"VisionPlunderBubble", "Core", 15},
+            {"SP Bullet", nil, 20, function(p) return p:FindFirstChild("Victim") ~= nil end},
+            {"Last Shot", nil, 20},
+            {"Main", nil, 25, function(p) return p:FindFirstChild("BloodTrail") ~= nil end},
+            {"HomingShard", nil, 20},
+            {"Bullet", nil, 20, function(p)
+                if p.Name:find("SP Bullet") or p.Name:find("SPBullet") then return false end
+                return p:FindFirstChild("Victim") == nil
+            end},
+            {"CrossFirePiece", nil, 40, function(p)
+                local fx = p:FindFirstChild("OnFireSparks")
+                return fx and fx.Enabled
+            end, true, true},
+            {"Baseball3", nil, 20},
+        }
+
+        local function withinRange(range)
+            local hrp = parryGetHRP()
+            if not hrp then return false, 0 end
+            return true, range
+        end
+
+        local function handleSound(sound, targetPart, state, cfg)
+            if not sound or not sound:IsA("Sound") then return end
+            local sid = sound.SoundId
+            if not sid then return end
+
+            local def, addw, dist
+            for pat, tbl in pairs(PERFECT_SOUNDS) do
+                if sid == pat then
+                    def = tbl.def or 0.2
+                    addw = tbl.addw or 0
+                    dist = tbl.dist or cfg.BlockRange
+                    break
+                end
+            end
+            if not def then
+                for pat, tbl in pairs(BASE_SOUNDS) do
+                    if sid == pat then
+                        def = tbl.def or 0.3
+                        addw = tbl.addw or 0
+                        dist = tbl.dist or cfg.BlockRange
+                        break
+                    end
+                end
+            end
+            if not def then return end
+
+            local ok, hrp = pcall(parryGetHRP)
+            if not ok or not hrp then return end
+            local refPart = targetPart or sound.Parent
+            if not refPart or not refPart:IsA("BasePart") then return end
+            local mag = (hrp.Position - refPart.Position).Magnitude
+            if mag > (dist or cfg.BlockRange) then return end
+
+            if state.BlockActions then return end
+            state.BlockActions = true
+            doBlock(state, cfg, def, addw, nil)
+        end
+
+        local function handleAnimTrack(track, targetPart, state, cfg)
+            if not track or not track.Animation then return end
+            local aid = track.Animation.AnimationId
+            if not aid then return end
+            for _, entry in ipairs(ANIM_UNBLOCK) do
+                local id = type(entry) == "table" and entry[1] or entry
+                local t = type(entry) == "table" and entry[2] or {}
+                if aid == id then
+                    local hrp = parryGetHRP()
+                    local refPart = targetPart or (track.Animation and track.Animation.Parent)
+                    if hrp and refPart and (hrp.Position - (refPart.Position or hrp.Position)).Magnitude <= (t.dist or cfg.BlockRange) then
+                        state.LastBlock = state.LastBlock + 1
+                        state.BlockActions = false
+                        fireParryUnblock(state, parryGetChar(), false)
+                    end
+                    return
+                end
+            end
+            -- broad animation-based block triggers (approximate)
+            local triggerIds = {
+                "rbxassetid://6048575522",
+                "rbxassetid://4096014941",
+                "rbxassetid://4211804997",
+                "rbxassetid://5303743107",
+                "rbxassetid://6105486059",
+                "rbxassetid://6049426097",
+            }
+            for _, id in ipairs(triggerIds) do
+                if aid == id then
+                    if state.BlockActions then return end
+                    state.BlockActions = true
+                    doBlock(state, cfg, 0.35, 0, nil)
+                    return
+                end
+            end
+        end
+
+        local function handleProjectile(part, state, cfg)
+            if not part or not part:IsA("BasePart") then return end
+            for _, entry in ipairs(PROJ_PATTERNS) do
+                local pattern, childName, range, checker = unpack(entry)
+                if part.Name:find(pattern) then
+                    local target = childName and part:FindFirstChild(childName) or part
+                    if checker and not checker(part) then return end
+                    if target then
+                        local hrp = parryGetHRP()
+                        if hrp then
+                            local dist = (hrp.Position - target.Position).Magnitude
+                            if dist <= (range + (cfg.ProjectileRangeBonus or 0)) then
+                                if not state.BlockActions or cfg.ProjectilesPriority then
+                                    state.BlockActions = cfg.ProjectilesPriority and 42000 or true
+                                    fireParryBlock(state, parryGetChar())
+                                    task.wait(0.432)
+                                    if not parryTimeStop() then
+                                        fireParryUnblock(state, parryGetChar(), false)
+                                    end
+                                    state.BlockActions = false
+                                end
+                                return
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        local function hookCharacter(char, state, cfg, conns)
+            if not char then return end
+            local animator = char:FindFirstChild("Animator", true)
+            if animator then
+                local c = animator.AnimationPlayed:Connect(function(track)
+                    if not state.Enabled then return end
+                    handleAnimTrack(track, char:FindFirstChild("HumanoidRootPart"), state, cfg)
+                end)
+                table.insert(conns, c)
+            end
+            local c2 = char.DescendantAdded:Connect(function(d)
+                if not state.Enabled then return end
+                if d:IsA("Sound") then
+                    task.wait(0.01)
+                    handleSound(d, char:FindFirstChild("HumanoidRootPart"), state, cfg)
+                elseif d:IsA("Animator") then
+                    task.wait(0.1)
+                    local c3 = d.AnimationPlayed:Connect(function(track)
+                        if not state.Enabled then return end
+                        handleAnimTrack(track, char:FindFirstChild("HumanoidRootPart"), state, cfg)
+                    end)
+                    table.insert(conns, c3)
+                end
+            end)
+            table.insert(conns, c2)
+        end
+
+        function Parry.Start()
+            if Parry.Running then return end
+            Parry.Running = true
+            local cfg = Parry.Config
+            local state = {
+                Enabled = true,
+                Blocking = false,
+                LastBlock = 0,
+                BlockActions = false,
+                LastTarget = nil,
+                HookedPlayers = {},
+            }
+            Parry.State = state
+            Parry.Connections = {}
+
+            -- Hook self + all other players
+            local function hookPlayer(plr)
+                if plr == LP or state.HookedPlayers[plr.Name] then return end
+                state.HookedPlayers[plr.Name] = true
+                if plr.Character then hookCharacter(plr.Character, state, cfg, Parry.Connections) end
+                table.insert(Parry.Connections, plr.CharacterAdded:Connect(function(c)
+                    hookCharacter(c, state, cfg, Parry.Connections)
+                end))
+            end
+            for _, plr in ipairs(Players:GetPlayers()) do hookPlayer(plr) end
+            table.insert(Parry.Connections, Players.PlayerAdded:Connect(hookPlayer))
+
+            table.insert(Parry.Connections, workspace.DescendantAdded:Connect(function(d)
+                if not state.Enabled then return end
+                if d:IsA("BasePart") and (d.Name:find("Bullet") or d.Name:find("SP Bullet") or d.Name:find("HomingShard") or d.Name:find("Projectile")) then
+                    handleProjectile(d, state, cfg)
+                end
+            end))
+
+            table.insert(Parry.Connections, LP.CharacterAdded:Connect(function(c)
+                hookCharacter(c, state, cfg, Parry.Connections)
+            end))
+
+            state.Enabled = true
+        end
+
+        function Parry.Stop()
+            Parry.Running = false
+            if Parry.State then
+                Parry.State.Enabled = false
+                fireParryUnblock(Parry.State, LP.Character, true)
+            end
+            for _, c in ipairs(Parry.Connections or {}) do
+                pcall(function() c:Disconnect() end)
+            end
+            Parry.Connections = {}
+            Parry.State = nil
+        end
+
+        -- ==================================================
+        -- 2) AUTO BARRAGE
+        -- ==================================================
+        local Barrage = {
+            Enabled = false,
+            Running = false,
+            Radius = 15,
+            Connections = {},
+            State = {Barraging = false},
+        }
+
+        local BARRAGE_ANIM_IDS = {
+            ["99682911857717"] = true, ["116404734852913"] = true,
+            ["6572640039"] = true, ["6936653670"] = true,
+            ["3510355751"] = true, ["74297051681404"] = true,
+            ["5248642110"] = true, ["4635691288"] = true,
+            ["3564702007"] = true, ["375581222"] = true,
+            ["4264140426"] = true, ["6572245980"] = true,
+            ["6938351900"] = true, ["13819815645"] = true,
+            ["85525529380684"] = true, ["12344317921"] = true,
+            ["10067522910"] = true, ["4842701605"] = true,
+            ["4139483350"] = true, ["102032545576547"] = true,
+            ["5227665355"] = true, ["616593932"] = true,
+            ["5234093084"] = true, ["76927399049290"] = true,
+            ["12439757027"] = true, ["5778001429"] = true,
+        }
+
+        local function barrageCooling(skill)
+            local pg = LP:FindFirstChildOfClass("PlayerGui")
+            local hud = pg and pg:FindFirstChild("HUD")
+            local cds = hud and hud:FindFirstChild("Cooldowns")
+            local frame = cds and cds:FindFirstChild("Frame")
+            return frame ~= nil and frame:FindFirstChild(skill) ~= nil
+        end
+
+        local function hasBarrageAnim(char)
+            if not char then return false end
+            local function scan(h)
+                if not h then return false end
+                local animator = h:FindFirstChildOfClass("Animator")
+                if not animator then return false end
+                for _, t in ipairs(animator:GetPlayingAnimationTracks()) do
+                    local aid = t.Animation and t.Animation.AnimationId
+                    if aid then
+                        local num = tostring(aid):match("%d+")
+                        if num and BARRAGE_ANIM_IDS[num] then return true end
+                    end
+                end
+                return false
+            end
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if scan(hum) then return true end
+            local sm = char:FindFirstChild("StandMorph")
+            if sm then
+                local h = sm:FindFirstChildOfClass("Humanoid") or sm:FindFirstChildOfClass("AnimationController")
+                if scan(h) then return true end
+            end
+            for _, d in ipairs(char:GetDescendants()) do
+                if d:IsA("Sound") and (d.Playing or d.IsPlaying or d.TimePosition > 0) then
+                    local num = tostring(d.SoundId):match("%d+")
+                    if num and BARRAGE_ANIM_IDS[num] then return true end
+                end
+            end
+            return false
+        end
+
+        function Barrage.Start()
+            if Barrage.Running then return end
+            Barrage.Running = true
+            Barrage.Enabled = true
+            Barrage.Connections = {}
+            Barrage.State = {Barraging = false}
+
+            local conn = RunService.Heartbeat:Connect(function()
+                if not Barrage.Enabled then return end
+                local char = LP.Character
+                if not char then return end
+                local hrp = char:FindFirstChild("HumanoidRootPart")
+                local remote = char:FindFirstChild("RemoteEvent")
+                if not hrp or not remote then return end
+                local sm = char:FindFirstChild("StandMorph")
+                local enemyNear = false
+                local living = workspace:FindFirstChild("Living")
+                if living then
+                    for _, child in ipairs(living:GetChildren()) do
+                        if child ~= char and child ~= sm and child:FindFirstChild("HumanoidRootPart") then
+                            local d = (child.HumanoidRootPart.Position - hrp.Position).Magnitude
+                            if d <= Barrage.Radius and hasBarrageAnim(child) then
+                                enemyNear = true
+                                break
+                            end
+                        end
+                    end
+                end
+                local ragdolled = char:FindFirstChild("RagdollParts") ~= nil
+                local barrageOnCooldown = barrageCooling("Stand Barrage")
+                local shouldFire = enemyNear and not ragdolled and not barrageOnCooldown
+                if shouldFire then
+                    Barrage.State.Barraging = true
+                    pcall(function() remote:FireServer("InputBegan", {Input = Enum.KeyCode.E}) end)
+                elseif Barrage.State.Barraging then
+                    Barrage.State.Barraging = false
+                    pcall(function() remote:FireServer("InputEnded", {Input = Enum.KeyCode.E}) end)
+                end
+            end)
+            table.insert(Barrage.Connections, conn)
+        end
+
+        function Barrage.Stop()
+            Barrage.Running = false
+            Barrage.Enabled = false
+            if Barrage.State and Barrage.State.Barraging then
+                local c = LP.Character
+                local r = c and c:FindFirstChild("RemoteEvent")
+                if r then pcall(function() r:FireServer("InputEnded", {Input = Enum.KeyCode.E}) end) end
+            end
+            for _, c in ipairs(Barrage.Connections or {}) do
+                pcall(function() c:Disconnect() end)
+            end
+            Barrage.Connections = {}
+            Barrage.State = {Barraging = false}
+        end
+
+        -- ==================================================
+        -- 3) CAMERA LOCK
+        -- ==================================================
+        local CamLock = {
+            Enabled = false,
+            Config = {
+                HoldKey = Enum.UserInputType.MouseButton2,
+                ToggleKey = Enum.KeyCode.Q,
+                ToggleKeyName = "Q",
+                FOV = 90,
+                Smoothing = 0.22,
+                TargetPart = "Head",
+                MaxDistance = 1000,
+                PredictTime = 0,
+                ShowFovCircle = false,
+                FovColor = Color3.fromRGB(0, 255, 80),
+                FovThickness = 1,
+                IgnoreFriends = false,
+            },
+            State = {
+                Holding = false,
+                Toggled = false,
+                Target = nil,
+                LastCFrame = nil,
+            },
+            Connections = {},
+            Drawing = {},
+            Target = nil,
+        }
+
+        local function camLockPart(char)
+            if not char then return nil end
+            return char:FindFirstChild(CamLock.Config.TargetPart)
+                or char:FindFirstChild("HumanoidRootPart")
+                or char:FindFirstChildWhichIsA("BasePart")
+        end
+
+        local function camLockIsFriend(plr)
+            if plr == LP then return true end
+            if CamLock.Config.IgnoreFriends then
+                local ok, f = pcall(function() return plr:IsFriendsWith(LP.UserId) end)
+                return ok and f
+            end
+            return false
+        end
+
+        local function camLockAlive(char)
+            if not char then return false end
+            local h = char:FindFirstChildOfClass("Humanoid")
+            return h and h.Health > 0
+        end
+
+        local function camLockWorldToScreen(pos)
+            local cam = workspace.CurrentCamera
+            if not cam then return nil end
+            local v, onScreen = cam:WorldToViewportPoint(pos)
+            return Vector2.new(v.X, v.Y), onScreen, v.Z
+        end
+
+        local function camLockBestPlayer()
+            local cam = workspace.CurrentCamera
+            if not cam then return nil end
+            local mouse = UserInputService:GetMouseLocation()
+            local best, bestDist = nil, nil
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr ~= LP and not camLockIsFriend(plr) then
+                    local char = plr.Character
+                    if char and camLockAlive(char) then
+                        local part = camLockPart(char)
+                        if part then
+                            local sp, onScreen, dist = camLockWorldToScreen(part.Position)
+                            if sp and onScreen and dist > 0 and dist <= CamLock.Config.MaxDistance then
+                                local d = (sp - mouse).Magnitude
+                                if d <= CamLock.Config.FOV and (not bestDist or d < bestDist) then
+                                    best, bestDist = plr, d
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            return best
+        end
+
+        local function ensureCamLockDrawings()
+            if not Drawing then return end
+            if not CamLock.Drawing.fov then
+                local ok, c = pcall(Drawing.new, "Circle")
+                if ok and c then
+                    c.Visible = false
+                    c.Color = CamLock.Config.FovColor
+                    c.Thickness = CamLock.Config.FovThickness
+                    c.NumSides = 64
+                    c.Filled = false
+                    c.Transparency = 0.7
+                    c.ZIndex = 4
+                    CamLock.Drawing.fov = c
+                end
+            end
+            if not CamLock.Drawing.dot then
+                local ok, c = pcall(Drawing.new, "Circle")
+                if ok and c then
+                    c.Visible = false
+                    c.Color = Color3.fromRGB(0, 255, 80)
+                    c.Thickness = 1
+                    c.NumSides = 24
+                    c.Filled = true
+                    c.Transparency = 1
+                    c.ZIndex = 5
+                    CamLock.Drawing.dot = c
+                end
+            end
+        end
+
+        local function camLockCleanup()
+            for _, c in ipairs(CamLock.Connections) do pcall(function() c:Disconnect() end) end
+            CamLock.Connections = {}
+            for _, d in pairs(CamLock.Drawing) do pcall(function() d:Remove() end) end
+            CamLock.Drawing = {}
+            CamLock.State.Target = nil
+            CamLock.State.Holding = false
+            CamLock.State.Toggled = false
+            if CamLock.Target then
+                local cam = workspace.CurrentCamera
+                local char = LP.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                if cam and hum then pcall(function() cam.CameraSubject = hum; cam.CameraType = Enum.CameraType.Custom end) end
+                CamLock.Target = nil
+            end
+        end
+
+        function CamLock.Start()
+            if CamLock.Enabled then return end
+            camLockCleanup()
+            CamLock.Enabled = true
+            ensureCamLockDrawings()
+
+            local cam = workspace.CurrentCamera
+            local renderConn = RunService.RenderStepped:Connect(function()
+                if not CamLock.Enabled then return end
+                cam = workspace.CurrentCamera
+                if not cam then return end
+
+                if CamLock.Drawing.fov then
+                    if CamLock.Config.ShowFovCircle then
+                        local mouse = UserInputService:GetMouseLocation()
+                        CamLock.Drawing.fov.Position = mouse
+                        CamLock.Drawing.fov.Radius = CamLock.Config.FOV
+                        CamLock.Drawing.fov.Color = CamLock.Config.FovColor
+                        CamLock.Drawing.fov.Thickness = CamLock.Config.FovThickness
+                        CamLock.Drawing.fov.Visible = true
+                    else
+                        CamLock.Drawing.fov.Visible = false
+                    end
+                end
+
+                local active = CamLock.State.Holding or CamLock.State.Toggled
+                if not active then return end
+
+                local target = CamLock.State.Target
+                if not (target and target.Parent and target.Character and camLockAlive(target.Character) and not camLockIsFriend(target)) then
+                    target = camLockBestPlayer()
+                    CamLock.State.Target = target
+                    CamLock.State.LastCFrame = cam.CFrame
+                end
+                if not target then
+                    if CamLock.Drawing.dot then CamLock.Drawing.dot.Visible = false end
+                    return
+                end
+                CamLock.Target = target
+
+                local part = camLockPart(target.Character)
+                if not part then return end
+                local pos = part.Position
+                if CamLock.Config.PredictTime > 0 then
+                    pos = pos + part.AssemblyLinearVelocity * CamLock.Config.PredictTime
+                end
+                local goal = CFrame.new(cam.CFrame.Position, pos)
+                local s = CamLock.Config.Smoothing
+                local nextCF = s > 0 and (CamLock.State.LastCFrame or cam.CFrame):Lerp(goal, 1 - s) or goal
+                CamLock.State.LastCFrame = nextCF
+                cam.CFrame = nextCF
+
+                if CamLock.Drawing.dot then
+                    local sp, onScreen = camLockWorldToScreen(part.Position)
+                    if sp and onScreen then
+                        CamLock.Drawing.dot.Position = sp
+                        CamLock.Drawing.dot.Visible = true
+                    else
+                        CamLock.Drawing.dot.Visible = false
+                    end
+                end
+            end)
+            table.insert(CamLock.Connections, renderConn)
+
+            table.insert(CamLock.Connections, UserInputService.InputBegan:Connect(function(input, gp)
+                if gp or not CamLock.Enabled then return end
+                if CamLock.Config.HoldKey and input.UserInputType == CamLock.Config.HoldKey then
+                    CamLock.State.Holding = true
+                elseif CamLock.Config.ToggleKey and input.KeyCode == CamLock.Config.ToggleKey then
+                    CamLock.State.Toggled = not CamLock.State.Toggled
+                    if not CamLock.State.Toggled and not CamLock.State.Holding then
+                        CamLock.State.Target = nil
+                        if CamLock.Drawing.dot then CamLock.Drawing.dot.Visible = false end
+                    end
+                end
+            end))
+
+            table.insert(CamLock.Connections, UserInputService.InputEnded:Connect(function(input)
+                if CamLock.Config.HoldKey and input.UserInputType == CamLock.Config.HoldKey then
+                    CamLock.State.Holding = false
+                    if not CamLock.State.Toggled then
+                        CamLock.State.Target = nil
+                        if CamLock.Drawing.dot then CamLock.Drawing.dot.Visible = false end
+                    end
+                end
+            end))
+        end
+
+        function CamLock.Stop()
+            CamLock.Enabled = false
+            camLockCleanup()
+        end
+
+        -- ==================================================
+        -- 4) UI: PvP TAB
+        -- ==================================================
+        local PvPTab = Window:Tab({Title = "PvP", Icon = "swords", Desc = "Auto Parry, Auto Barrage, Camera Lock."})
+
+        -- === AUTO PARRY SECTION ===
+        local ParrySection = PvPTab:Section({Title = "Auto Parry", Side = "left"})
+        ParrySection:Paragraph({
+            Title = "Auto Parry",
+            Desc = "Blocks automatically based on enemy sounds, animations, and projectiles.",
+        })
+        ParrySection:Slider({
+            Title = "Auto Parry Timing (ms)",
+            Desc = "Delay before blocking. Lower = tighter.",
+            Value = {Min = 20, Max = 120, Default = 50},
+            Step = 1,
+            Callback = function(v)
+                Parry.Config.ReactionDelay = (tonumber(v) or 50) / 1000
+            end,
+        })
+        ParrySection:Slider({
+            Title = "Auto Parry Distance (studs)",
+            Desc = "Only parry if enemy is within this range.",
+            Value = {Min = 10, Max = 120, Default = 25},
+            Step = 1,
+            Callback = function(v) Parry.Config.BlockRange = tonumber(v) or 25 end,
+        })
+        ParrySection:Slider({
+            Title = "Projectile Bonus Range",
+            Desc = "Extra range for incoming bullets.",
+            Value = {Min = 0, Max = 80, Default = 15},
+            Step = 1,
+            Callback = function(v) Parry.Config.ProjectileRangeBonus = tonumber(v) or 15 end,
+        })
+        ParrySection:Toggle({
+            Title = "Auto Parry",
+            Desc = "Enable Auto Parry.",
+            Icon = "shield",
+            Value = false,
+            Callback = function(state)
+                if state then
+                    Parry.Start()
+                    Window:Notify({Title = "PvP", Content = "Auto Parry enabled.", Type = "Success", Duration = 3})
+                else
+                    Parry.Stop()
+                    Window:Notify({Title = "PvP", Content = "Auto Parry disabled.", Type = "Info", Duration = 3})
+                end
+            end,
+        })
+
+        -- === AUTO BARRAGE SECTION ===
+        local BarrageSection = PvPTab:Section({Title = "Auto Barrage", Side = "right"})
+        BarrageSection:Paragraph({
+            Title = "Auto Barrage",
+            Desc = "Auto-fires your barrage when an enemy barrages within range.",
+        })
+        BarrageSection:Slider({
+            Title = "Auto Barrage Radius",
+            Desc = "Detection radius in studs.",
+            Value = {Min = 1, Max = 50, Default = 15},
+            Step = 1,
+            Callback = function(v) Barrage.Radius = tonumber(v) or 15 end,
+        })
+        BarrageSection:Toggle({
+            Title = "Auto Barrage",
+            Desc = "Enable Auto Barrage.",
+            Icon = "zap",
+            Value = false,
+            Callback = function(state)
+                if state then
+                    Barrage.Start()
+                    Window:Notify({Title = "PvP", Content = "Auto Barrage enabled.", Type = "Success", Duration = 3})
+                else
+                    Barrage.Stop()
+                    Window:Notify({Title = "PvP", Content = "Auto Barrage disabled.", Type = "Info", Duration = 3})
+                end
+            end,
+        })
+
+        -- === CAMERA LOCK SECTION ===
+        local CamSection = PvPTab:Section({Title = "Camera Lock", Side = "left"})
+        CamSection:Paragraph({
+            Title = "Camera Lock",
+            Desc = "Locks your camera to the nearest player in FOV.",
+        })
+        CamSection:Dropdown({
+            Title = "Hold Button",
+            Desc = "Hold to enable camera lock.",
+            Values = {"None", "Left", "Right", "Middle"},
+            Value = "Right",
+            Multi = false,
+            Callback = function(v)
+                if type(v) == "table" then v = v[1] end
+                local map = {
+                    ["None"] = nil,
+                    ["Left"] = Enum.UserInputType.MouseButton1,
+                    ["Right"] = Enum.UserInputType.MouseButton2,
+                    ["Middle"] = Enum.UserInputType.MouseButton3,
+                }
+                CamLock.Config.HoldKey = map[v]
+                CamLock.State.Holding = false
+            end,
+        })
+        CamSection:Dropdown({
+            Title = "Toggle Key",
+            Desc = "Press once to toggle camera lock.",
+            Values = {"None","Q","E","R","T","Y","U","I","O","P","F","G","H","J","K","L","Z","X","C","V","B","N","M","LeftAlt","LeftControl","LeftShift"},
+            Value = "Q",
+            Multi = false,
+            Callback = function(v)
+                if type(v) == "table" then v = v[1] end
+                CamLock.Config.ToggleKeyName = v
+                if v ~= "None" then CamLock.Config.ToggleKey = Enum.KeyCode[v] else CamLock.Config.ToggleKey = nil end
+                CamLock.State.Toggled = false
+            end,
+        })
+        CamSection:Dropdown({
+            Title = "Target Part",
+            Desc = "Which body part to aim at.",
+            Values = {"Head", "HumanoidRootPart"},
+            Value = "Head",
+            Multi = false,
+            Callback = function(v)
+                if type(v) == "table" then v = v[1] end
+                CamLock.Config.TargetPart = v
+            end,
+        })
+        CamSection:Slider({
+            Title = "FOV (pixels)",
+            Desc = "Aim assist cone in pixels.",
+            Value = {Min = 10, Max = 600, Default = 90},
+            Step = 5,
+            Callback = function(v) CamLock.Config.FOV = tonumber(v) or 90 end,
+        })
+        CamSection:Slider({
+            Title = "Smoothing",
+            Desc = "0 = snap, 0.95 = barely moves.",
+            Value = {Min = 0, Max = 0.95, Default = 0.22},
+            Step = 0.01,
+            Callback = function(v) CamLock.Config.Smoothing = tonumber(v) or 0.22 end,
+        })
+        CamSection:Slider({
+            Title = "Max Distance (studs)",
+            Desc = "Don't aim beyond this range.",
+            Value = {Min = 50, Max = 5000, Default = 1000},
+            Step = 50,
+            Callback = function(v) CamLock.Config.MaxDistance = tonumber(v) or 1000 end,
+        })
+        CamSection:Slider({
+            Title = "Prediction (s)",
+            Desc = "Aim ahead of moving targets. 0 = off.",
+            Value = {Min = 0, Max = 0.3, Default = 0},
+            Step = 0.01,
+            Callback = function(v) CamLock.Config.PredictTime = tonumber(v) or 0 end,
+        })
+        CamSection:Toggle({
+            Title = "Show FOV Circle",
+            Desc = "Draws the FOV circle on screen.",
+            Value = false,
+            Callback = function(v) CamLock.Config.ShowFovCircle = v end,
+        })
+        CamSection:Toggle({
+            Title = "Ignore Friends",
+            Desc = "Don't lock onto friends.",
+            Value = false,
+            Callback = function(v) CamLock.Config.IgnoreFriends = v end,
+        })
+        CamSection:Toggle({
+            Title = "Camera Lock",
+            Desc = "Enable camera lock.",
+            Icon = "target",
+            Value = false,
+            Callback = function(state)
+                if state then
+                    CamLock.Start()
+                    Window:Notify({Title = "PvP", Content = "Camera Lock enabled.", Type = "Success", Duration = 3})
+                else
+                    CamLock.Stop()
+                    Window:Notify({Title = "PvP", Content = "Camera Lock disabled.", Type = "Info", Duration = 3})
+                end
+            end,
+        })
+
+        -- Expose for external scripts / cleanup
+        _G.__MethionPvP = {Parry = Parry, Barrage = Barrage, CamLock = CamLock}
+        _G.__MethionPvP.Cleanup = function()
+            pcall(Parry.Stop)
+            pcall(Barrage.Stop)
+            pcall(CamLock.Stop)
+        end
+        _G.__MethionPvP.CleanupOld = _G.__MethionPvP.CleanupOld
+    end)
+
+    if not okPvP then
+        warn("[Methion] PvP module failed to load: " .. tostring(errPvP))
+    end
+end
 Loops.noclip()
 Loops.farm()
 Loops.itemLabels()
